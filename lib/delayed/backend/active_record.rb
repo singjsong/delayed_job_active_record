@@ -7,6 +7,11 @@ module Delayed
       class Job < ::ActiveRecord::Base
         include Delayed::Backend::Base
 
+        if ::ActiveRecord::VERSION::MAJOR < 4 || defined?(::ActiveRecord::MassAssignmentSecurity)
+          attr_accessible :priority, :run_at, :queue, :payload_object,
+                          :failed_at, :locked_at, :locked_by, :handler
+        end
+
         scope :by_priority, lambda { order('priority ASC, run_at ASC') }
 
         attr_accessible :priority, :run_at, :queue, :payload_object,
@@ -19,7 +24,7 @@ module Delayed
           self.table_name = delayed_job_table_name
         end
 
-        self.set_delayed_job_table_name
+        set_delayed_job_table_name
 
         def self.ready_to_run(worker_name, max_run_time)
           where('(run_at <= ? AND (locked_at IS NULL OR locked_at < ?) OR locked_by = ?) AND failed_at IS NULL', db_time_now, db_time_now - max_run_time, worker_name)
@@ -38,46 +43,51 @@ module Delayed
           where(:locked_by => worker_name).update_all(:locked_by => nil, :locked_at => nil)
         end
 
-        def self.reserve(worker, max_run_time = Worker.max_run_time)
+        def self.reserve(worker, max_run_time = Worker.max_run_time) # rubocop:disable CyclomaticComplexity
           # scope to filter to records that are "ready to run"
-          readyScope = self.ready_to_run(worker.name, max_run_time)
+          ready_scope = ready_to_run(worker.name, max_run_time)
 
           # scope to filter to the single next eligible job
-          readyScope = readyScope.where('priority >= ?', Worker.min_priority) if Worker.min_priority
-          readyScope = readyScope.where('priority <= ?', Worker.max_priority) if Worker.max_priority
-          readyScope = readyScope.where(:queue => Worker.queues) if Worker.queues.any?
-          job = readyScope.by_priority.first
+          ready_scope = ready_scope.where('priority >= ?', Worker.min_priority) if Worker.min_priority
+          ready_scope = ready_scope.where('priority <= ?', Worker.max_priority) if Worker.max_priority
+          ready_scope = ready_scope.where(:queue => Worker.queues) if Worker.queues.any?
+          ready_scope = ready_scope.by_priority
 
-          now = self.db_time_now
+          now = db_time_now
 
-          return unless job
-          job.with_lock do
-            job.locked_at = now
-            job.locked_by = worker.name
-            job.save!
-          end
-          job
-        end
-
-        # Lock this job for this worker.
-        # Returns true if we have the lock, false otherwise.
-        def lock_exclusively!(max_run_time, worker)
-          now = self.class.db_time_now
-          affected_rows = if locked_by != worker
-            # We don't own this job so we will update the locked_by name and the locked_at
-            self.class.update_all(["locked_at = ?, locked_by = ?", now, worker], ["id = ? and (locked_at is null or locked_at < ?) and (run_at <= ?)", id, (now - max_run_time.to_i), now])
+          # Optimizations for faster lookups on some common databases
+          case connection.adapter_name
+          when 'PostgreSQL'
+            # Custom SQL required for PostgreSQL because postgres does not support UPDATE...LIMIT
+            # This locks the single record 'FOR UPDATE' in the subquery (http://www.postgresql.org/docs/9.0/static/sql-select.html#SQL-FOR-UPDATE-SHARE)
+            # Note: active_record would attempt to generate UPDATE...LIMIT like sql for postgres if we use a .limit() filter, but it would not use
+            # 'FOR UPDATE' and we would have many locking conflicts
+            quoted_table_name = connection.quote_table_name(table_name)
+            subquery_sql      = ready_scope.limit(1).lock(true).select('id').to_sql
+            reserved          = find_by_sql(["UPDATE #{quoted_table_name} SET locked_at = ?, locked_by = ? WHERE id IN (#{subquery_sql}) RETURNING *", now, worker.name])
+            reserved[0]
+          when 'MySQL', 'Mysql2'
+            # This works on MySQL and possibly some other DBs that support UPDATE...LIMIT. It uses separate queries to lock and return the job
+            count = ready_scope.limit(1).update_all(:locked_at => now, :locked_by => worker.name)
+            return nil if count == 0
+            where(:locked_at => now, :locked_by => worker.name, :failed_at => nil).first
+          when 'MSSQL', 'Teradata'
+            # The MSSQL driver doesn't generate a limit clause when update_all is called directly
+            subsubquery_sql = ready_scope.limit(1).to_sql
+            # select("id") doesn't generate a subquery, so force a subquery
+            subquery_sql = "SELECT id FROM (#{subsubquery_sql}) AS x"
+            quoted_table_name = connection.quote_table_name(table_name)
+            sql = ["UPDATE #{quoted_table_name} SET locked_at = ?, locked_by = ? WHERE id IN (#{subquery_sql})", now, worker.name]
+            count = connection.execute(sanitize_sql(sql))
+            return nil if count == 0
+            # MSSQL JDBC doesn't support OUTPUT INSERTED.* for returning a result set, so query locked row
+            where(:locked_at => now, :locked_by => worker.name, :failed_at => nil).first
           else
-            # We already own this job, this may happen if the job queue crashes.
-            # Simply resume and update the locked_at
-            self.class.update_all(["locked_at = ?", now], ["id = ? and locked_by = ?", id, worker])
-          end
-          if affected_rows == 1
-            self.locked_at = now
-            self.locked_by = worker
-            self.changed_attributes.clear
-            return true
-          else
-            return false
+            # This is our old fashion, tried and true, but slower lookup
+            ready_scope.limit(worker.read_ahead).detect do |job|
+              count = ready_scope.where(:id => job.id).update_all(:locked_at => now, :locked_by => worker.name)
+              count == 1 && job.reload
+            end
           end
         end
 
